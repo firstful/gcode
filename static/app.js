@@ -569,6 +569,15 @@ function wire() {
   });
   $('btn-reset').addEventListener('click', ()=>{ if(parsed){ playing=false; $('btn-play').textContent='Play'; setLayer(0); accum=0; } });
   $('btn-fit').addEventListener('click', fitCamera);
+  $('btn-sample').addEventListener('click', async ()=>{
+    $('status').textContent='Loading sample...';
+    try {
+      const r = await fetch('/sample.gcode');
+      if (!r.ok) throw new Error('HTTP '+r.status);
+      const b = await r.blob();
+      loadFile(new File([b], 'plate_holders_12.gcode'));
+    } catch(e){ $('status').textContent='Error: '+e.message; $('status').className='err'; }
+  });
   $('layer').addEventListener('input', e=>{ if(parsed){ playing=false; $('btn-play').textContent='Play'; setLayer(parseInt(e.target.value)); } });
   $('colorby').addEventListener('change', ()=>{ if(parsed) buildExtrusion(); });
   $('opacity').addEventListener('input', ()=>{ if(extrusionMesh) extrusionMesh.material.opacity = parseFloat($('opacity').value); });
