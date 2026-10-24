@@ -61,6 +61,7 @@ function parseSettings(lines) {
   let colors = null;
   let layerHeight = 0.2;
   let nozzleDiam = 0.4;
+  let lineWidth = 0.42;
   for (const raw of lines) {
     const m = raw.match(/^;\s*([a-zA-Z_]+)\s*=\s*(.+)$/);
     if (!m) continue;
@@ -77,9 +78,11 @@ function parseSettings(lines) {
       layerHeight = parseFloat(val) || layerHeight;
     } else if (key === 'nozzle_diameter') {
       nozzleDiam = parseFloat(val) || nozzleDiam;
+    } else if (key === 'line_width') {
+      lineWidth = parseFloat(val) || lineWidth;
     }
   }
-  return { bed, colors, layerHeight, nozzleDiam };
+  return { bed, colors, layerHeight, nozzleDiam, lineWidth };
 }
 
 function parseGcode(text) {
@@ -279,7 +282,7 @@ function parseGcode(text) {
     extrudeMm: totalExtrude.toFixed(1),
   };
 
-  return { segments, travelSegs, toolChanges, pauses, layers, layerCum, bed: settings.bed, colors, stats, layerHeight: settings.layerHeight, nozzleDiam: settings.nozzleDiam };
+  return { segments, travelSegs, toolChanges, pauses, layers, layerCum, bed: settings.bed, colors, stats, layerHeight: settings.layerHeight, nozzleDiam: settings.nozzleDiam, lineWidth: settings.lineWidth };
 }
 
 // ---------- rendering helpers ----------
@@ -328,37 +331,60 @@ function buildExtrusion() {
   if (travelMesh) { scene.remove(travelMesh); travelMesh.geometry.dispose(); travelMesh.material.dispose(); travelMesh=null; }
 
   const segs = parsed.segments;
-  const positions = new Float32Array(segs.length*2*3);
-  const colors = new Float32Array(segs.length*2*3);
+  const totalLayers = parsed.layers.length;
   const maxSpeed = segs.reduce((a,s)=>Math.max(a, s.speed||0), 1);
   const minZ = segs.reduce((a,s)=>Math.min(a, s.start[2], s.end[2]), 0);
   const maxZ = segs.reduce((a,s)=>Math.max(a, s.start[2], s.end[2]), 1);
-  const totalLayers = parsed.layers.length;
+
+  // line width from gcode (default 0.42)
+  const lw = (parsed.lineWidth || 0.42);
+  const radius = lw / 2;
+
+  // unit cylinder along Y axis
+  const cylGeo = new THREE.CylinderGeometry(radius, radius, 1, 6, 1);
+  const cylMat = new THREE.MeshStandardMaterial({ transparent: true, opacity: parseFloat($('opacity').value), roughness: 0.6, metalness: 0.1 });
+  extrusionMesh = new THREE.InstancedMesh(cylGeo, cylMat, Math.max(1, segs.length));
+  extrusionMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  extrusionMesh.count = 0;
+
+  const tmpPos = new THREE.Vector3();
+  const tmpQuat = new THREE.Quaternion();
+  const tmpScale = new THREE.Vector3();
+  const tmpMat = new THREE.Matrix4();
+  const up = new THREE.Vector3(0,1,0);
+  const dir = new THREE.Vector3();
+
   for (let i=0;i<segs.length;i++){
     const s = segs[i];
-    const a = i*6;
-    // start
-    positions[a+0]=s.start[0]; positions[a+1]=s.start[2]; positions[a+2]=s.start[1];
-    // end
-    positions[a+3]=s.end[0]; positions[a+4]=s.end[2]; positions[a+5]=s.end[1];
+    const sx=s.start[0], sy=s.start[2], sz=s.start[1];
+    const ex=s.end[0], ey=s.end[2], ez=s.end[1];
+    dir.set(ex-sx, ey-sy, ez-sz);
+    const len = dir.length();
+    tmpPos.set((sx+ex)/2, (sy+ey)/2, (sz+ez)/2);
+    if (len > 1e-9) {
+      dir.normalize();
+      tmpQuat.setFromUnitVectors(up, dir);
+      tmpScale.set(1, len, 1);
+    } else {
+      tmpQuat.identity();
+      tmpScale.set(0,0,0);
+    }
+    tmpMat.compose(tmpPos, tmpQuat, tmpScale);
+    extrusionMesh.setMatrixAt(i, tmpMat);
+
     let c;
     const mode = $('colorby').value;
     if (mode==='tool') c = colorForTool(s.tool);
     else if (mode==='layer') c = layerColor(s.layer, totalLayers);
     else if (mode==='speed') c = speedColor(s.speed, maxSpeed);
     else c = heightColor((s.start[2]+s.end[2])/2, minZ, maxZ);
-    colors[a+0]=c.r; colors[a+1]=c.g; colors[a+2]=c.b;
-    colors[a+3]=c.r; colors[a+4]=c.g; colors[a+5]=c.b;
+    extrusionMesh.setColorAt(i, c);
   }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(positions,3));
-  geo.setAttribute('color', new THREE.BufferAttribute(colors,3));
-  geo.setDrawRange(0,0);
-  const mat = new THREE.LineBasicMaterial({ vertexColors:true, transparent:true, opacity: parseFloat($('opacity').value), linewidth:1 });
-  extrusionMesh = new THREE.LineSegments(geo, mat);
+  extrusionMesh.instanceMatrix.needsUpdate = true;
+  if (extrusionMesh.instanceColor) extrusionMesh.instanceColor.needsUpdate = true;
   scene.add(extrusionMesh);
 
-  // travel
+  // travel (thin lines) unchanged
   if ($('show-travel').checked && parsed.travelSegs.length) {
     const tpos = new Float32Array(parsed.travelSegs.length*2*3);
     for (let i=0;i<parsed.travelSegs.length;i++){
@@ -416,7 +442,8 @@ function setDrawToSegment(idx) {
   if (!extrusionMesh) return;
   const total = parsed.segments.length;
   idx = Math.max(0, Math.min(total, idx));
-  extrusionMesh.geometry.setDrawRange(0, idx*2);
+  extrusionMesh.count = idx;
+  if (extrusionMesh.instanceMatrix) extrusionMesh.instanceMatrix.needsUpdate = false;
   // nozzle position
   if (idx>0 && idx<=total) {
     const s = parsed.segments[idx-1];
