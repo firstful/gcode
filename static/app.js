@@ -234,7 +234,10 @@ function parseGcode(text) {
   }
 
   // normalize layers: ensure layer indices contiguous from 0
-  const maxL = [0, ...segments.map(s=>s.layer), ...toolChanges.map(t=>t.layer), ...pauses.map(p=>p.layer)].reduce((a,b)=>Math.max(a,b),0);
+  let maxL = 0;
+  for (const s of segments) if (s.layer > maxL) maxL = s.layer;
+  for (const t of toolChanges) if (t.layer > maxL) maxL = t.layer;
+  for (const p of pauses) if (p.layer > maxL) maxL = p.layer;
   // build layer list with Z
   const layers = [];
   for (let L=0; L<=maxL; L++) {
@@ -327,9 +330,9 @@ function buildExtrusion() {
   const segs = parsed.segments;
   const positions = new Float32Array(segs.length*2*3);
   const colors = new Float32Array(segs.length*2*3);
-  const maxSpeed = Math.max(1, ...segs.map(s=>s.speed));
-  const minZ = Math.min(...segs.map(s=>s.start[2]), 0);
-  const maxZ = Math.max(...segs.map(s=>s.end[2]), 1);
+  const maxSpeed = segs.reduce((a,s)=>Math.max(a, s.speed||0), 1);
+  const minZ = segs.reduce((a,s)=>Math.min(a, s.start[2], s.end[2]), 0);
+  const maxZ = segs.reduce((a,s)=>Math.max(a, s.start[2], s.end[2]), 1);
   const totalLayers = parsed.layers.length;
   for (let i=0;i<segs.length;i++){
     const s = segs[i];
