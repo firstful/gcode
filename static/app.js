@@ -1,12 +1,15 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const $ = id => document.getElementById(id);
 
 // ---------- state ----------
 let scene, camera, renderer, controls;
 let bedMesh = null, grid = null, originMarker = null;
-let extrusionMesh = null;   // LineSegments
+let extrusionMesh = null;   // legacy alias (current layer instanced)
+let currentLayerInstanced = null;
+let layerMergedMeshes = [];
 let travelMesh = null;
 let nozzle = null;
 let markerGroup = null;
@@ -326,34 +329,81 @@ function buildPlate(bed) {
   scene.add(originMarker);
 }
 
-function buildExtrusion() {
-  if (extrusionMesh) { scene.remove(extrusionMesh); extrusionMesh.geometry.dispose(); extrusionMesh.material.dispose(); extrusionMesh=null; }
-  if (travelMesh) { scene.remove(travelMesh); travelMesh.geometry.dispose(); travelMesh.material.dispose(); travelMesh=null; }
-
-  const segs = parsed.segments;
+function buildLayerMerged(L) {
+  const segs = parsed.segments.filter(s => s.layer === L);
+  if (!segs.length) return null;
+  const lw = parsed.lineWidth || 0.42;
+  const radius = lw / 2;
   const totalLayers = parsed.layers.length;
   const maxSpeed = segs.reduce((a,s)=>Math.max(a, s.speed||0), 1);
   const minZ = segs.reduce((a,s)=>Math.min(a, s.start[2], s.end[2]), 0);
   const maxZ = segs.reduce((a,s)=>Math.max(a, s.start[2], s.end[2]), 1);
-
-  // line width from gcode (default 0.42)
-  const lw = (parsed.lineWidth || 0.42);
-  const radius = lw / 2;
-
-  // unit cylinder along Y axis
-  const cylGeo = new THREE.CylinderGeometry(radius, radius, 1, 6, 1);
-  const cylMat = new THREE.MeshStandardMaterial({ transparent: true, opacity: parseFloat($('opacity').value), roughness: 0.6, metalness: 0.1 });
-  extrusionMesh = new THREE.InstancedMesh(cylGeo, cylMat, Math.max(1, segs.length));
-  extrusionMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  extrusionMesh.count = 0;
-
+  const mode = $('colorby').value;
+  const geos = [];
   const tmpPos = new THREE.Vector3();
   const tmpQuat = new THREE.Quaternion();
   const tmpScale = new THREE.Vector3();
   const tmpMat = new THREE.Matrix4();
   const up = new THREE.Vector3(0,1,0);
   const dir = new THREE.Vector3();
+  for (const s of segs) {
+    const sx=s.start[0], sy=s.start[2], sz=s.start[1];
+    const ex=s.end[0], ey=s.end[2], ez=s.end[1];
+    dir.set(ex-sx, ey-sy, ez-sz);
+    const len = dir.length();
+    const cylGeo = new THREE.CylinderGeometry(radius, radius, 1, 4, 1);
+    // color attribute
+    let c;
+    if (mode==='tool') c = colorForTool(s.tool);
+    else if (mode==='layer') c = layerColor(s.layer, totalLayers);
+    else if (mode==='speed') c = speedColor(s.speed, maxSpeed);
+    else c = heightColor((s.start[2]+s.end[2])/2, minZ, maxZ);
+    const vCount = cylGeo.attributes.position.count;
+    const colorArr = new Float32Array(vCount*3);
+    for (let v=0; v<vCount; v++){ colorArr[v*3]=c.r; colorArr[v*3+1]=c.g; colorArr[v*3+2]=c.b; }
+    cylGeo.setAttribute('color', new THREE.Float32BufferAttribute(colorArr, 3));
+    if (len > 1e-9) {
+      dir.normalize();
+      tmpQuat.setFromUnitVectors(up, dir);
+      tmpPos.set((sx+ex)/2, (sy+ey)/2, (sz+ez)/2);
+      tmpScale.set(1, len, 1);
+      tmpMat.compose(tmpPos, tmpQuat, tmpScale);
+      cylGeo.applyMatrix4(tmpMat);
+    } else {
+      // zero-length: skip
+      cylGeo.dispose();
+      continue;
+    }
+    geos.push(cylGeo);
+  }
+  if (!geos.length) return null;
+  const merged = mergeGeometries(geos, false);
+  geos.forEach(g=>g.dispose());
+  if (!merged) return null;
+  const mat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: parseFloat($('opacity').value) });
+  const mesh = new THREE.Mesh(merged, mat);
+  mesh.visible = false;
+  return mesh;
+}
 
+function buildCurrentLayerInstanced(L) {
+  if (currentLayerInstanced) { scene.remove(currentLayerInstanced); currentLayerInstanced.geometry.dispose(); currentLayerInstanced.material.dispose(); currentLayerInstanced=null; }
+  const segs = parsed.segments.filter(s => s.layer === L);
+  if (!segs.length) return;
+  const lw = parsed.lineWidth || 0.42;
+  const radius = lw / 2;
+  const totalLayers = parsed.layers.length;
+  const maxSpeed = segs.reduce((a,s)=>Math.max(a, s.speed||0), 1);
+  const minZ = segs.reduce((a,s)=>Math.min(a, s.start[2], s.end[2]), 0);
+  const maxZ = segs.reduce((a,s)=>Math.max(a, s.start[2], s.end[2]), 1);
+  const mode = $('colorby').value;
+  const cylGeo = new THREE.CylinderGeometry(radius, radius, 1, 4, 1);
+  const cylMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: parseFloat($('opacity').value) });
+  const mesh = new THREE.InstancedMesh(cylGeo, cylMat, Math.max(1, segs.length));
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.count = 0;
+  const tmpPos = new THREE.Vector3(), tmpQuat = new THREE.Quaternion(), tmpScale = new THREE.Vector3(), tmpMat = new THREE.Matrix4();
+  const up = new THREE.Vector3(0,1,0), dir = new THREE.Vector3();
   for (let i=0;i<segs.length;i++){
     const s = segs[i];
     const sx=s.start[0], sy=s.start[2], sz=s.start[1];
@@ -361,30 +411,35 @@ function buildExtrusion() {
     dir.set(ex-sx, ey-sy, ez-sz);
     const len = dir.length();
     tmpPos.set((sx+ex)/2, (sy+ey)/2, (sz+ez)/2);
-    if (len > 1e-9) {
-      dir.normalize();
-      tmpQuat.setFromUnitVectors(up, dir);
-      tmpScale.set(1, len, 1);
-    } else {
-      tmpQuat.identity();
-      tmpScale.set(0,0,0);
-    }
+    if (len > 1e-9) { dir.normalize(); tmpQuat.setFromUnitVectors(up, dir); tmpScale.set(1, len, 1); }
+    else { tmpQuat.identity(); tmpScale.set(0,0,0); }
     tmpMat.compose(tmpPos, tmpQuat, tmpScale);
-    extrusionMesh.setMatrixAt(i, tmpMat);
-
+    mesh.setMatrixAt(i, tmpMat);
     let c;
-    const mode = $('colorby').value;
     if (mode==='tool') c = colorForTool(s.tool);
     else if (mode==='layer') c = layerColor(s.layer, totalLayers);
     else if (mode==='speed') c = speedColor(s.speed, maxSpeed);
     else c = heightColor((s.start[2]+s.end[2])/2, minZ, maxZ);
-    extrusionMesh.setColorAt(i, c);
+    mesh.setColorAt(i, c);
   }
-  extrusionMesh.instanceMatrix.needsUpdate = true;
-  if (extrusionMesh.instanceColor) extrusionMesh.instanceColor.needsUpdate = true;
-  scene.add(extrusionMesh);
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  currentLayerInstanced = mesh;
+  extrusionMesh = mesh;
+  scene.add(mesh);
+}
 
-  // travel (thin lines) unchanged
+function buildExtrusion() {
+  // cleanup
+  if (currentLayerInstanced) { scene.remove(currentLayerInstanced); currentLayerInstanced.geometry.dispose(); currentLayerInstanced.material.dispose(); currentLayerInstanced=null; }
+  for (const m of layerMergedMeshes) { if (m) { scene.remove(m); m.geometry.dispose(); m.material.dispose(); } }
+  layerMergedMeshes = [];
+  if (travelMesh) { scene.remove(travelMesh); travelMesh.geometry.dispose(); travelMesh.material.dispose(); travelMesh=null; }
+
+  // build current layer instanced (layer 0)
+  buildCurrentLayerInstanced(0);
+
+  // travel
   if ($('show-travel').checked && parsed.travelSegs.length) {
     const tpos = new Float32Array(parsed.travelSegs.length*2*3);
     for (let i=0;i<parsed.travelSegs.length;i++){
@@ -401,8 +456,65 @@ function buildExtrusion() {
 
   buildMarkers();
   fitCamera();
+
+  // background: build merged meshes for all layers in chunks
+  let L = 0;
+  const total = parsed.layers.length;
+  function step() {
+    if (L >= total) { $('status').textContent = 'Ready — ' + total + ' layers merged'; return; }
+    const m = buildLayerMerged(L);
+    layerMergedMeshes[L] = m;
+    if (m) { m.visible = (L < currentLayer); scene.add(m); }
+    L++;
+    $('status').textContent = 'Merging layers... ' + L + '/' + total;
+    setTimeout(step, 0);
+  }
+  setTimeout(step, 0);
 }
 
+function ensureLayerMerged(L) {
+  if (L < 0 || L >= parsed.layers.length) return null;
+  if (layerMergedMeshes[L] === undefined) {
+    const m = buildLayerMerged(L);
+    layerMergedMeshes[L] = m;
+    if (m) { m.visible = false; scene.add(m); }
+  }
+  return layerMergedMeshes[L];
+}
+
+function setLayer(L) {
+  if (!parsed) return;
+  L = Math.max(0, Math.min(parsed.layers.length-1, L));
+  currentLayer = L;
+  // ensure merged meshes for completed layers
+  for (let i=0;i<L;i++) ensureLayerMerged(i);
+  // show merged for completed, hide others
+  for (let i=0;i<layerMergedMeshes.length;i++) {
+    const m = layerMergedMeshes[i];
+    if (m) m.visible = (i < L);
+  }
+  // current layer: instanced
+  buildCurrentLayerInstanced(L);
+  // set count for animation: show all segments of current layer
+  if (currentLayerInstanced) currentLayerInstanced.count = parsed.segments.filter(s=>s.layer===L).length;
+  // nozzle position
+  const segs = parsed.segments.filter(s=>s.layer===L);
+  if (segs.length) {
+    const last = segs[segs.length-1];
+    nozzle.position.set(last.end[0], last.end[2], last.end[1]);
+    nozzle.visible = true;
+  } else {
+    nozzle.visible = false;
+  }
+  $('layer').value = L;
+  $('badge-layer').textContent = 'layer ' + (L+1) + '/' + parsed.layers.length;
+  const cum = parsed.layerCum[L] ?? 0;
+  $('timeline').textContent = (L+1) + ' / ' + parsed.layers.length + ' layers  ·  ' + cum + ' / ' + parsed.segments.length + ' segs';
+  const pct = parsed.segments.length ? (cum/parsed.segments.length*100) : 0;
+  $('progress-bar').style.width = pct + '%';
+  const tool = segs.length ? segs[segs.length-1].tool : 0;
+  $('badge-tool').textContent = 'T' + tool;
+}
 function buildMarkers() {
   // clear
   while (markerGroup.children.length) {
@@ -453,23 +565,6 @@ function setDrawToSegment(idx) {
     nozzle.visible = false;
   }
   // trail highlight? handled by draw range already
-}
-
-function setLayer(L) {
-  if (!parsed) return;
-  L = Math.max(0, Math.min(parsed.layers.length-1, L));
-  currentLayer = L;
-  const cum = parsed.layerCum[L] ?? 0;
-  setDrawToSegment(cum);
-  $('layer').value = L;
-  $('badge-layer').textContent = `layer ${L+1}/${parsed.layers.length}`;
-  $('timeline').textContent = `${L+1} / ${parsed.layers.length} layers  ·  ${cum} / ${parsed.segments.length} segs`;
-  const pct = parsed.segments.length ? (cum/parsed.segments.length*100) : 0;
-  $('progress-bar').style.width = pct + '%';
-  // tool at this layer
-  const segs = parsed.segments.filter(s=>s.layer===L);
-  const tool = segs.length ? segs[segs.length-1].tool : 0;
-  $('badge-tool').textContent = `T${tool}`;
 }
 
 function tickPlay(dt) {
@@ -610,7 +705,7 @@ function wire() {
   });
   $('layer').addEventListener('input', e=>{ if(parsed){ playing=false; $('btn-play').textContent='Play'; setLayer(parseInt(e.target.value)); } });
   $('colorby').addEventListener('change', ()=>{ if(parsed) buildExtrusion(); });
-  $('opacity').addEventListener('input', ()=>{ if(extrusionMesh) extrusionMesh.material.opacity = parseFloat($('opacity').value); });
+  $('opacity').addEventListener('input', ()=>{ const v=parseFloat($('opacity').value); if(extrusionMesh) extrusionMesh.material.opacity=v; for(const m of layerMergedMeshes) if(m) m.material.opacity=v; });
   $('show-travel').addEventListener('change', ()=>{ if(parsed) buildExtrusion(); });
   $('show-markers').addEventListener('change', ()=>{ if(parsed) buildMarkers(); });
   $('show-plate').addEventListener('change', e=>{
